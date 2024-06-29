@@ -10,7 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using SuperSocket.Channel;
+using SuperSocket.Connection;
 using SuperSocket.Client;
 using SuperSocket.ProtoBase;
 using SuperSocket.WebSocket;
@@ -25,6 +25,8 @@ namespace WebSocket4Net
         private const string _magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
         public Uri Uri { get; private set; }
+
+        public bool AutoPingEnabled { get; set; }
 
         public CloseStatus CloseStatus { get; private set; }
 
@@ -52,13 +54,13 @@ namespace WebSocket4Net
         }
 
         public WebSocket(string url, ILogger logger)
-            : this(url, new ChannelOptions { Logger = logger })
+            : this(url, new ConnectionOptions { Logger = logger })
         {
 
         }
 
-        public WebSocket(string url, ChannelOptions channelOptions)
-            : base(new HandshakePipelineFilter(), channelOptions)
+        public WebSocket(string url, ConnectionOptions connectionOptions)
+            : base(new HandshakePipelineFilter(), connectionOptions)
         {
             Uri = new Uri(url);
 
@@ -77,7 +79,7 @@ namespace WebSocket4Net
                 throw new ArgumentException("Unexpected url schema.", nameof(url));
             }
 
-            PingPongStatus = new PingPongStatus(new AutoPingOptions(60 * 5, 5));
+            PingPongStatus = new PingPongStatus();
         }
 
         private EndPoint ResolveUri(Uri uri, int defaultPort)
@@ -109,6 +111,12 @@ namespace WebSocket4Net
             subProtocols.Add(protocol);
         }
 
+        protected override void SetupConnection(IConnection connection)
+        {
+            this.Closed += OnConnectionClosed;
+            base.SetupConnection(connection);
+        }
+
         public async ValueTask<bool> OpenAsync(CancellationToken cancellationToken = default)
         {
             State = WebSocketState.Connecting;
@@ -120,7 +128,7 @@ namespace WebSocket4Net
             }
 
             var (key, acceptKey) = MakeSecureKey();
-            await this.Channel.SendAsync((writer) => WriteHandshakeRequest(writer, key));
+            await this.Connection.SendAsync((writer) => WriteHandshakeRequest(writer, key));
 
             var handshakeResponse = await ReceiveAsync();
 
@@ -152,7 +160,13 @@ namespace WebSocket4Net
             }
 
             State = WebSocketState.Open;
-            PingPongStatus.Start();
+
+            if (AutoPingEnabled)
+            {
+                var autoPingTask = PingPongStatus.RunAutoPing(this, new AutoPingOptions(60 * 5, 5));
+                _ = autoPingTask.ContinueWith(t => OnError("AutoPing failed", t.Exception), TaskContinuationOptions.OnlyOnFaulted);
+            }
+            
             return true;
         }
 
@@ -189,17 +203,29 @@ namespace WebSocket4Net
 
         public new async ValueTask<WebSocketPackage> ReceiveAsync()
         {
-            return await ReceiveAsync(false);
+            return await ReceiveAsync(
+                handleControlPackage: true,
+                returnControlPackage: false);
         }
 
-        public async ValueTask<WebSocketPackage> ReceiveAsync(bool returnControlPackage)
+        internal async ValueTask<WebSocketPackage> ReceiveAsync(bool handleControlPackage, bool returnControlPackage)
         {
             var package = await base.ReceiveAsync();
 
-            if (!returnControlPackage && package.OpCode != OpCode.Binary && package.OpCode != OpCode.Text && package.OpCode != OpCode.Handshake)
+            if (package == null)
+                return null;
+
+            if (package.OpCode != OpCode.Binary && package.OpCode != OpCode.Text && package.OpCode != OpCode.Handshake)
             {
-                await HandleControlPackage(package);
-                return await ReceiveAsync(returnControlPackage);
+                if (handleControlPackage)
+                {
+                    await HandleControlPackage(package);
+                }
+
+                if (!returnControlPackage)
+                {
+                    return await ReceiveAsync(handleControlPackage, returnControlPackage);
+                }
             }
 
             return package;
@@ -216,20 +242,24 @@ namespace WebSocket4Net
             await base.OnPackageReceived(package);
         }
 
-        private ValueTask HandleControlPackage(WebSocketPackage package)
+        private async ValueTask HandleControlPackage(WebSocketPackage package)
         {
-            if (package.OpCode == OpCode.Close)
+            switch (package.OpCode)
             {
-                HandleCloseHandshake(package);
-                return new ValueTask();
+                case (OpCode.Close):
+                    await HandleCloseHandshake(package);
+                    break;
+
+                case (OpCode.Ping):
+                    PingPongStatus.OnPingReceived(package);
+                    package.OpCode = OpCode.Pong;
+                    await this.SendAsync(package);
+                    break;
+
+                case (OpCode.Pong):
+                    PingPongStatus.OnPongReceived(package);
+                    break;
             }
-
-            if (package.OpCode == OpCode.Ping)
-                return PingPongStatus.OnPingReceived(package);
-            else if (package.OpCode == OpCode.Pong)
-                return PingPongStatus.OnPongReceived(package);
-
-            return new ValueTask(); 
         }
 
         public async ValueTask SendAsync(string message)
@@ -310,7 +340,9 @@ namespace WebSocket4Net
 
             State = WebSocketState.CloseSent;
 
-            var closeHandshakeResponse = await ReceiveAsync(true);
+            var closeHandshakeResponse = await ReceiveAsync(
+                handleControlPackage: false,
+                returnControlPackage: true);
 
             if (closeHandshakeResponse.OpCode != OpCode.Close)
             {
@@ -318,7 +350,7 @@ namespace WebSocket4Net
             }
             else
             {
-                HandleCloseHandshake(closeHandshakeResponse);
+                await HandleCloseHandshake(closeHandshakeResponse);
             }
 
             await base.CloseAsync();
@@ -326,37 +358,50 @@ namespace WebSocket4Net
             State = WebSocketState.Closed;
         }
 
-        private void HandleCloseHandshake(WebSocketPackage receivedClosePackage)
+        private CloseStatus DecodeCloseStatus(WebSocketPackage closePackage)
         {
-            var reader = new SequenceReader<byte>(receivedClosePackage.Data);
-
-            reader.TryReadBigEndian(out ushort closeReason);
+            var reader = new SequenceReader<byte>(closePackage.Data);
+            reader.TryReadBigEndian(out ushort closeReason);            
             var reasonText = reader.ReadString(_utf8Encoding);
+
+            return new CloseStatus
+                {
+                    Reason = (CloseReason)closeReason,
+                    ReasonText = reasonText
+                };
+        }
+
+        private async ValueTask HandleCloseHandshake(WebSocketPackage receivedClosePackage)
+        {
+            var closeStatusFromRemote = DecodeCloseStatus(receivedClosePackage);
 
             var closeStatus = CloseStatus;
 
             if (closeStatus == null)
             {
-                CloseStatus = new CloseStatus
+                this.State = WebSocketState.CloseReceived;
+                closeStatusFromRemote.RemoteInitiated = true;
+                CloseStatus = closeStatusFromRemote;
+                // Send close pong message to server side.
+                await SendAsync(receivedClosePackage);
+            }
+            else
+            {
+                if (closeStatus.Reason != closeStatusFromRemote.Reason)
                 {
-                    Reason = (CloseReason)closeReason,
-                    ReasonText = reasonText
-                };
+                    OnError("Unmatched CloseReason");
+                    return;
+                }
+                
+                // Received the close pong message from server,
+                // so we can close the connection safely now
+                await base.CloseAsync();
+            }
+        }
 
-                return;
-            }
-
-            if (closeStatus.Reason != (CloseReason)closeReason)
-            {
-                OnError("Unmatched CloseReason");
-                return;
-            }
-            
-            if (closeStatus.ReasonText != reasonText)
-            {
-                OnError("Unmatched CloseReasonText");
-                return;
-            }
+        private void OnConnectionClosed(object sender, EventArgs eventArgs)
+        {
+            this.State = WebSocketState.Closed;
         }
     }
 }

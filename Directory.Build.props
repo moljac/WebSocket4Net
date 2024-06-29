@@ -1,8 +1,11 @@
 <Project>
   <Import Project="Dependencies.props" />
   <PropertyGroup>
-    <LangVersion>8.0</LangVersion>
-    <LibTargetFramework>netstandard2.1</LibTargetFramework>
+    <LangVersion>10.0</LangVersion>
+  </PropertyGroup>
+  <PropertyGroup>
+    <DotNetTargetFrameworks>netstandard2.1;net5.0;net6.0;net7.0;net8.0</DotNetTargetFrameworks>
+    <MobileTargetFrameworks>net7.0-ios;net7.0-android;net7.0-macos;net7.0-tvos;net8.0-ios;net8.0-android;net8.0-macos;net8.0-tvos</MobileTargetFrameworks>
   </PropertyGroup>
   <PropertyGroup>
     <PackageProjectUrl>https://github.com/kerryjiang/WebSocket4Net</PackageProjectUrl>
@@ -13,13 +16,11 @@
     <IncludeSource>true</IncludeSource>
     <Authors>Kerry Jiang and other contributors</Authors>
     <Owners>Kerry Jiang</Owners>
+    <Description>A popular .NET websocket client.</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Nerdbank.GitVersioning">
-      <Version>3.3.37</Version>
-      <PrivateAssets>all</PrivateAssets>
-    </PackageReference>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
